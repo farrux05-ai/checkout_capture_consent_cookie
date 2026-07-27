@@ -177,6 +177,12 @@ function mapConsentToGtag(privacy) {
   };
 }
 
+// Server tomonida aniq filtr qo'yish uchun (GTM'ning "ko'rinmas" ichki
+// holatiga ishonib o'tirmasdan), so'nggi ma'lum consent holatini shu
+// yerda saqlab boramiz — har bir event payload'iga ANIQ MAYDON sifatida
+// qo'shib yuboramiz (pastda, prepareDataLayerObject ichida).
+let currentConsentState = null;
+
 function initConsentMode() {
   const initialPrivacy = initContext?.customerPrivacy;
   if (isLog) console.log('CONSENT: boshlang\'ich privacy snapshot', initialPrivacy);
@@ -184,15 +190,14 @@ function initConsentMode() {
   // 1) Boshlang'ich holatni GTM konteyner yuklanishidan OLDIN joylashtiramiz.
   //    Bu SHART — aks holda GTM yuklangan zahoti ishga tushadigan tag'lar
   //    (masalan GA4 config) consent holatisiz otilib ketishi mumkin.
-  const defaultConsent = Object.assign(
-    mapConsentToGtag(initialPrivacy),
-    { wait_for_update: 500 }
-  );
-  gtag('consent', 'default', defaultConsent);
+  const defaultConsent = mapConsentToGtag(initialPrivacy);
+  currentConsentState = defaultConsent;
+  gtag('consent', 'default', Object.assign({}, defaultConsent, { wait_for_update: 500 }));
   if (isLog) console.log('CONSENT: default yuborildi ->', defaultConsent);
 
   // 2) Consent keyinchalik o'zgarsa (checkout'da ham banner ko'rsatilishi
-  //    mumkin bo'lgan hududlarda) — yangilanishni GTM'ga yetkazamiz.
+  //    mumkin bo'lgan hududlarda) — yangilanishni GTM'ga yetkazamiz VA
+  //    saqlab qo'yamiz, keyingi eventlar shu yangilangan holatni olsin.
   if (typeof customerPrivacy === 'undefined' || !customerPrivacy?.subscribe) {
     if (isLog) console.warn('CONSENT: customerPrivacy.subscribe topilmadi — faqat default bilan qolamiz');
     return;
@@ -200,6 +205,7 @@ function initConsentMode() {
 
   customerPrivacy.subscribe('visitorConsentCollected', (event) => {
     const updatedConsent = mapConsentToGtag(event?.customerPrivacy);
+    currentConsentState = updatedConsent;
     gtag('consent', 'update', updatedConsent);
     if (isLog) console.log('CONSENT: update yuborildi ->', updatedConsent, 'raw:', event?.customerPrivacy);
   });
@@ -268,26 +274,132 @@ async function safeGetCookie(name) {
   }
 }
 
+// "GCL.<vaqt>.<qiymat>" formatidan qiymatni ajratib olish. Oxirgi
+// bo'lakni emas, IKKINCHI nuqtadan keyingi HAMMA qismini olamiz — chunki
+// gclid/gbraid'ning o'zi nazariy jihatdan nuqta belgisini o'z ichiga
+// olishi mumkin, oxirgi bo'lakni olish bu holda uni qirqib tashlaydi.
+function extractAfterSecondDot(raw) {
+  if (!raw) return null;
+  const firstDot = raw.indexOf('.');
+  if (firstDot < 0) return null;
+  const secondDot = raw.indexOf('.', firstDot + 1);
+  if (secondDot < 0) return null;
+  const value = raw.substring(secondDot + 1);
+  return value || null;
+}
+
 async function getMarketingCookies() {
   if (typeof browser === 'undefined' || !browser?.cookie?.get) {
     if (isLog) console.warn('COOKIE: browser.cookie mavjud emas — bo\'sh qiymatlar bilan davom etamiz');
-    return { fbc: null, fbp: null, gclid: null, gcl_aw_raw: null, ttp: null };
+    return { fbc: null, fbp: null, gclid: null, gcl_aw_raw: null, gbraid: null, gcl_gb_raw: null, ttp: null };
   }
 
   // Barcha cookie'larni PARALLEL o'qiymiz (Promise.all) — ketma-ket
   // o'qisak, har birining kutish vaqti qo'shilib, umumiy kechikish oshadi.
-  const [fbc, fbp, gclAw, ttp] = await Promise.all([
+  const [fbc, fbp, gclAw, gclGb, ttp] = await Promise.all([
     safeGetCookie('_fbc'),
     safeGetCookie('_fbp'),
-    safeGetCookie('_gcl_aw'),
+    safeGetCookie('_gcl_aw'),   // gclid shu yerda
+    safeGetCookie('_gcl_gb'),   // gbraid shu yerda (iOS/app kampaniyalari)
     safeGetCookie('_ttp')
   ]);
 
-  const gclid = gclAw ? gclAw.split('.').pop() : null;
-  const result = { fbc, fbp, gclid, gcl_aw_raw: gclAw, ttp };
+  const gclid = extractAfterSecondDot(gclAw);
+  const gbraid = extractAfterSecondDot(gclGb);
+  const result = {
+    fbc, fbp, ttp,
+    gclid, gcl_aw_raw: gclAw,
+    gbraid, gcl_gb_raw: gclGb
+  };
 
   if (isLog) console.log('COOKIE: o\'qilgan qiymatlar ->', result);
   return result;
+}
+
+// wbraid uchun aniq, keng tarqalgan cookie nomi topilmadi (past ishonch) —
+// shuning uchun buni faqat URL'dan o'qiymiz. UTM parametrlari ham xuddi
+// shunday: standart cookie yo'q, faqat checkout URL'ida saqlanib qolgan
+// bo'lsa o'qiladi. KO'P HOLLARDA BULAR `null` BO'LISHI KUTILGAN — checkout
+// paytiga kelib bu parametrlar odatda URL'dan yo'qolgan bo'ladi (agar
+// tema o'zi maxsus saqlamasa). Xato emas, faqat cheklov.
+function getUrlBasedSignals(url) {
+  let params;
+  try {
+    params = new URL(url).searchParams;
+  } catch (err) {
+    if (isLog) console.warn('URL: parse qilinmadi ->', url, err);
+    return { wbraid: null, utm_source: null, utm_medium: null, utm_campaign: null, utm_term: null, utm_content: null };
+  }
+
+  const result = {
+    wbraid: params.get('wbraid') || null,
+    utm_source: params.get('utm_source') || null,
+    utm_medium: params.get('utm_medium') || null,
+    utm_campaign: params.get('utm_campaign') || null,
+    utm_term: params.get('utm_term') || null,
+    utm_content: params.get('utm_content') || null,
+  };
+
+  if (isLog) console.log('URL: signallar ->', result);
+  return result;
+}
+
+// =======================================================================
+// ATTRIBUTION (UTM + Click-ID) PERSISTENCE — browser.localStorage
+// =======================================================================
+// Storefront'da UTM/click-ID URL'da bo'ladi, lekin checkout URL'ida
+// yo'qoladi. Shu sababli localStorage ga saqlab, checkout'da tiklaymiz.
+// 30 daqiqa TTL — reklama attribusiyasi uchun standart.
+
+const ATTR_KEY = 'shopify_pixel_attr_v1';
+const ATTR_TTL_MS = 30 * 60 * 1000; // 30 daqiqa
+
+async function persistAttribution(url) {
+  try {
+    const params = new URL(url).searchParams;
+    const raw = await browser.localStorage.getItem(ATTR_KEY);
+    let stored = {};
+    try { stored = raw ? JSON.parse(raw) : {}; } catch (e) {}
+    const fresh = {
+      utm_source: params.get('utm_source'),
+      utm_medium: params.get('utm_medium'),
+      utm_campaign: params.get('utm_campaign'),
+      utm_term: params.get('utm_term'),
+      utm_content: params.get('utm_content'),
+      gclid: params.get('gclid'),
+      fbclid: params.get('fbclid'),
+      wbraid: params.get('wbraid'),
+    };
+    const merged = { ...stored };
+    for (const [key, value] of Object.entries(fresh)) {
+      if (value !== null && value !== undefined && value !== '') {
+        merged[key] = value;
+      }
+    }
+    merged.saved_at = Date.now();
+    await browser.localStorage.setItem(ATTR_KEY, JSON.stringify(merged));
+    if (isLog) console.log('ATTR: saqlandi ->', merged);
+  } catch (err) {
+    if (isLog) console.warn('ATTR: saqlashda xato ->', err);
+  }
+}
+
+async function getAttribution() {
+  try {
+    const raw = await browser.localStorage.getItem(ATTR_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (Date.now() - (parsed.saved_at || 0) > ATTR_TTL_MS) {
+      await browser.localStorage.removeItem(ATTR_KEY);
+      if (isLog) console.log('ATTR: 30 daqiqa o\'tdi, tozalandi');
+      return {};
+    }
+    const { saved_at, ...rest } = parsed;
+    return rest;
+  } catch (err) {
+    if (isLog) console.warn('ATTR: o\'qishda xato ->', err);
+    return {};
+  }
 }
 
 async function prepareDataLayerObject(event, eventName) {
@@ -303,20 +415,62 @@ async function prepareDataLayerObject(event, eventName) {
   const market = extractMarketData(event);
   const marketingCookies = await getMarketingCookies();
 
+  // === URL tozalash (oxiridagi ] belgisi) ===
+ const rawUrl = event?.context?.document?.location?.href ||
+    initContext?.context?.document?.location?.href ||
+    href;
+  const currentUrl = rawUrl.replace(/\]$/, '');
+
+  // === URL'dan joriy parametrlar ===
+  const urlParams = new URL(currentUrl).searchParams;
+  const currentUtmSource = urlParams.get('utm_source');
+  const currentGclid = urlParams.get('gclid');
+
+  // === Storefront'da yangi attribution bo'lsa -> saqlash ===
+  if (currentUtmSource || currentGclid || urlParams.get('utm_medium') || urlParams.get('fbclid') || urlParams.get('wbraid')) {
+    await persistAttribution(currentUrl);
+  }
+
+  // === localStorage'dan eski attribution (checkout fallback) ===
+  const stored = await getAttribution();
+
+  // === Yakuniy merge: URL > localStorage > cookie (gclid uchun) > null ===
+  const utm_source = currentUtmSource || stored.utm_source || null;
+  const utm_medium = urlParams.get('utm_medium') || stored.utm_medium || null;
+  const utm_campaign = urlParams.get('utm_campaign') || stored.utm_campaign || null;
+  const utm_term = urlParams.get('utm_term') || stored.utm_term || null;
+  const utm_content = urlParams.get('utm_content') || stored.utm_content || null;
+  const gclid = currentGclid || stored.gclid || marketingCookies.gclid || null;
+  const wbraid = urlParams.get('wbraid') || stored.wbraid || null;
+  const fbclid = urlParams.get('fbclid') || stored.fbclid || null;
+
+  if (isLog && (utm_source || stored.utm_source)) {
+    console.log('ATTR: merge ->', { current: currentUtmSource, stored: stored.utm_source, final: utm_source });
+  }
+
   let obj = {
     event: event_name[eventName],
     event_id: generateEventId(event, eventName),
     user_data: clearObj(userData),
     cart_state,
     ecomm_pagetype,
-    actual_url: href,
-    // QISM 2: marketing click-ID'lari — GTM'da alohida Data Layer
-    // Variable orqali o'qib, Google Ads/Meta/TikTok server tag'lariga
-    // uzatiladi. Qiymat topilmasa `null` bo'ladi (bu normal holat).
+    actual_url: currentUrl,
+    // QISM 2: marketing click-ID'lari
     fbc: marketingCookies.fbc,
     fbp: marketingCookies.fbp,
-    gclid: marketingCookies.gclid,
+    gclid: gclid,
+    gbraid: marketingCookies.gbraid,
     ttp: marketingCookies.ttp,
+    // QISM 2b: URL asosidagi signallar + localStorage fallback
+    wbraid: wbraid,
+    utm_source: utm_source,
+    utm_medium: utm_medium,
+    utm_campaign: utm_campaign,
+    utm_term: utm_term,
+    utm_content: utm_content,
+    fbclid: fbclid,
+    // Server tomonida ANIQ filtr qo'yish uchun
+    consent: event?.consent || currentConsentState,
   };
 
   if ([
@@ -367,8 +521,6 @@ async function handleAnalyticsEvent(event) {
   const eventName = event.name;
   const isPageViewed = eventName === "page_viewed";
 
-  // prepareDataLayerObject endi async — ichida browser.cookie.get() orqali
-  // cookie o'qiydi (QISM 2), shuning uchun await qilamiz.
   const data = await prepareDataLayerObject(event, eventName);
   if (isLog) {
     console.log('Send event data', data);
@@ -425,7 +577,6 @@ function getPageType() {
   else if (path.includes('/checkout')) { return 'basket'; }
   else { return 'other'; }
 }
-
 // -----------------------------------------------------------------------
 // loadGTM — Stape'ning first-party (custom subdomain) GTM loader kodi.
 // Bu qism o'zgartirilmadi — u allaqachon sizning shaxsiy subdomeningiz
@@ -514,9 +665,9 @@ function loadGTM(key) {
       var uaMatch = new RegExp("Version/([0-9._]+)(.*Mobile)?.*Safari.*").exec(navigator.userAgent);
       isSafariIOS16Plus = !!UID_SOURCE && !!uaMatch && 16.4 <= parseFloat(uaMatch[1]);
       isStapeUserId = "stapeUserId" === UID_SOURCE;
-      uidValue = (isSafariIOS16Plus && !isStapeUserId)
-        ? resolveUid(UID_SOURCE, UID_KEY, UID_ATTRIBUTE)
-        : undefined;
+      uidValue = (isSafariIOS16Plus && !isStapeUserId) ?
+        resolveUid(UID_SOURCE, UID_KEY, UID_ATTRIBUTE) :
+        undefined;
       isSafariIOS16Plus = isSafariIOS16Plus && (!!uidValue || isStapeUserId);
     } catch (uidError) {
       console.error(uidError);
@@ -531,9 +682,9 @@ function loadGTM(key) {
 
     var effectiveContainerId = CONTAINER_ID;
     if (isSafariIOS16Plus) {
-      effectiveContainerId = 8 < CONTAINER_ID.length
-        ? CONTAINER_ID.replace(/([a-z]{8}$)/, "kp$1")
-        : "kp" + CONTAINER_ID;
+      effectiveContainerId = 8 < CONTAINER_ID.length ?
+        CONTAINER_ID.replace(/([a-z]{8}$)/, "kp$1") :
+        "kp" + CONTAINER_ID;
     }
     var baseUrl = (!isSafariIOS16Plus && GTM_LOADER_DOMAIN_FALLBACK) ? GTM_LOADER_DOMAIN_FALLBACK : GTM_LOADER_DOMAIN;
 
