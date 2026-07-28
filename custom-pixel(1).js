@@ -3,83 +3,78 @@
  * CUSTOM PIXEL — Checkout Events → Stape GTM (first-party subdomain)
  * ============================================================================
  *
- * NIMA O'ZGARDI VA NEGA:
+ * WHAT CHANGED AND WHY:
  *
- * 1) Stape App'ning umumiy CDN'idan (sp.stapecdn.com) skript fetch() qilish
- *    butunlay OLIB TASHLANDI. Bu domen barcha Stape mijozlari uchun umumiy
- *    bo'lgani sababli EasyList/EasyPrivacy kabi adblock ro'yxatlarida tez-tez
- *    bloklanadi — bloklansa, .then() ichidagi subscribe ham ishga tushmay
- *    qoladi va hech narsa yozilmaydi. Buning o'rniga faqat sizning shaxsiy
- *    (first-party) subdomeningiz — data.farruxbek.online — orqali GTM
- *    konteynerini yuklovchi loadGTM() qoldirildi. Bu ancha bloklarga chidamli,
- *    chunki u faqat sizning do'koningizga tegishli, umumiy signature'ga ega
- *    emas.
+ * 1) The fetch() call to Stape App's shared CDN (sp.stapecdn.com) was
+ *    removed entirely. That domain is shared across every Stape customer,
+ *    so it frequently ends up on adblock lists (EasyList/EasyPrivacy) — if
+ *    blocked, the subscribe() call inside the .then() never runs and
+ *    nothing gets tracked. Instead, only loadGTM() remains, which loads
+ *    the GTM container from your own first-party subdomain
+ *    (data.farruxbek.online). This is far more resistant to blockers,
+ *    since it isn't a shared, publicly known tracking domain.
  *
- * 2) event_id endi shu yerning O'ZIDA, bitta joyda generatsiya qilinadi va
- *    dataLayer obyektiga bir marta yoziladi (generateEventId funksiyasi).
- *    Bitta dataLayer.push() natijasida GTM konteyneridagi HAM pixel tag
- *    (Facebook/TikTok Pixel by Stape), HAM server Data Tag bir xil
- *    dataLayer'dan o'qiydi — shuning uchun ikkalasi ham AYNAN bir xil
- *    event_id bilan ketadi. Avval Stape'ning o'zi avtomatik generatsiya
- *    qilganda hybrid rejimda ikki tomon uchun ikki xil ID yasalgani sababli
- *    dedup ishlamayotgan edi — bu endi tuzatildi.
+ * 2) event_id is now generated in exactly one place and written to the
+ *    dataLayer object once (generateEventId()). A single dataLayer.push()
+ *    means both the client-side pixel tag (Facebook/TikTok Pixel by
+ *    Stape) and the server Data Tag read the identical event_id from the
+ *    same dataLayer entry — so both sides always match. Previously, when
+ *    Stape auto-generated the ID itself in a hybrid setup, the two sides
+ *    generated two different IDs, breaking deduplication. That's fixed now.
  *
- * 3) checkout_completed (purchase) uchun event_id ORDER ID asosida BARQAROR
- *    qilib yasaladi (tasodifiy emas). Sabab: thank-you sahifasi qayta
- *    yuklansa (F5, orqaga/oldinga tugmasi), checkout_completed yana otilishi
- *    mumkin. Agar shu holatda tasodifiy ID ishlatilsa, Meta/TikTok/GA4 buni
- *    IKKINCHI xarid deb hisoblab, ROAS/sotuvlar raqamini shishirib yuboradi.
- *    Order ID hech qachon o'zgarmagani uchun, qayta otilgan event ham xuddi
- *    shu event_id bilan ketadi va reklama tizimlari uni avtomatik ravishda
- *    "allaqachon ko'rilgan" deb tashlab yuboradi (dedup) — ya'ni bitta order
- *    = bitta konversiya, necha marta sahifa yuklansa ham.
+ * 3) For checkout_completed (purchase), event_id is built from the STABLE
+ *    order ID (not random). Reason: if the thank-you page reloads (F5,
+ *    back/forward), checkout_completed can fire again. With a random ID,
+ *    Meta/TikTok/GA4 would count that as a second purchase, inflating
+ *    ROAS/sales numbers. Since the order ID never changes, the replayed
+ *    event carries the same event_id and ad platforms deduplicate it
+ *    automatically — one order = one conversion, no matter how many times
+ *    the page reloads.
  *
- * 4) Qolgan barcha eventlar (add_payment_info, begin_checkout va h.k.) uchun
- *    Shopify'ning o'zi har bir chaqiruv uchun kafolatlab beradigan event.id
- *    ishlatiladi (Shopify Web Pixels API'da har bir event.id — shu bitta
- *    dispatch uchun unique). Bizga alohida crypto.randomUUID() yasashning
- *    hojati yo'q — muhimi shuki, bu qiymat FAQAT shu yerda bir marta o'qiladi
- *    va bitta dataLayer obyektiga yoziladi, ikki marta emas.
+ * 4) For every other event (add_payment_info, begin_checkout, etc.), we
+ *    use event.id, which Shopify guarantees is unique per dispatch (per
+ *    the Web Pixels API). There's no need to mint our own
+ *    crypto.randomUUID() — what matters is that this value is read once,
+ *    here, and written into a single dataLayer object, not generated
+ *    twice.
  *
  * ----------------------------------------------------------------------------
- * GTM TOMONIDA QILISHINGIZ KERAK BO'LGAN ISHLAR (bu kod ishlashi uchun):
+ * REQUIRED GTM-SIDE SETUP (for this code to work):
  *
- *   a) GTM'da yangi "Data Layer Variable" yarating: nomi masalan
- *      "DLV - event_id", Data Layer Variable Name maydoniga: event_id
+ *   a) In GTM, create a new Data Layer Variable, e.g. named
+ *      "DLV - event_id", with Data Layer Variable Name: event_id
  *
- *   b) Quyidagi TAG'larning har birida "Event ID" (yoki "event_id") maydoniga
- *      shu {{DLV - event_id}} o'zgaruvchisini biriktiring:
+ *   b) In each of the following TAGS, bind the "Event ID" (or "event_id")
+ *      field to {{DLV - event_id}}:
  *         - [Stape] Meta - AddPaymentInfo / AddToCart / InitiateCheckout /
  *           PageView / Purchase / Search / ViewContent
- *         - [Stape] TikTok - (xuddi shu ro'yxat)
- *         - [Stape] DT - * (Data Tag'lar — bular Stape Client orqali server
- *           konteynerga event_id'ni ham olib o'tadi, u yerda Meta CAPI /
- *           TikTok Events API tag'lari ham shu event_id'ni o'qishi kerak)
+ *         - [Stape] TikTok - (same list)
+ *         - [Stape] DT - * (Data Tags — these carry event_id through Stape
+ *           Client to the server container, where the Meta CAPI / TikTok
+ *           Events API tags must also read this same event_id)
  *
- *   c) Har bir shu tag ichida "Auto-generate Event ID" yoki shunga o'xshash
- *      avtomatik ID generatsiya toggle'i bor bo'lsa — uni O'CHIRING. Aks
- *      holda Stape yana o'zicha qo'shimcha ID yasab, bizning aniq
- *      event_id'imiz ustidan yozib yuborishi yoki unga qo'shimcha bo'lib
- *      qolishi mumkin.
+ *   c) If any of these tags has an "Auto-generate Event ID" toggle (or
+ *      similar), turn it OFF. Otherwise Stape may generate an additional
+ *      ID of its own, either overwriting or duplicating alongside the
+ *      exact event_id we already set.
  *
- *   d) Shopify Admin → Settings → Customer events bo'limini oching va agar
- *      u yerda Stape App tomonidan avtomatik o'rnatilgan alohida "Web Pixel"
- *      (aynan o'sha fetch(sp.stapecdn.com...) kodi) faol turgan bo'lsa —
- *      uni O'CHIRING yoki OLIB TASHLANG. Aks holda ikkita pixel bir vaqtda
- *      ishlaydi, GTM konteyneri ikki marta yuklanadi va har bir event ikki
- *      baravar (duplicate) bo'lib ketadi.
+ *   d) In Shopify Admin → Settings → Customer events, check whether Stape
+ *      App's own auto-installed Web Pixel (the one with the
+ *      fetch(sp.stapecdn.com...) code) is still active. If so, disable or
+ *      remove it — otherwise two pixels run simultaneously, the GTM
+ *      container loads twice, and every event fires twice (duplicated).
  * ============================================================================
  */
 
-// Shopify Custom Pixel muharriri `analytics`, `browser`, `init` obyektlarini
-// tayyor holda taqdim etadi (register() shart emas) — shuning uchun ularni
-// bevosita ishlatamiz, window orqali emas. Bu, jumladan, Shopify'ning o'z
-// statik tekshiruvchisi "analytics.subscribe(...)" chaqiruvini aniqroq
-// tanib olishiga yordam beradi (rasmiy misollarda ham shunday yoziladi).
+// The Shopify Custom Pixel editor provides `analytics`, `browser`, and
+// `init` objects ready to use (no register() wrapper needed) — so we use
+// them directly rather than through window. This also helps Shopify's own
+// static checker recognize the "analytics.subscribe(...)" call more
+// reliably (this is how the official examples write it too).
 const initContext = init;
 
-const GTM_ID = '5TCF99SP'; // Settings tag'dan
-const GTM_URL = 'https://data.farruxbek.online'; // First-party (custom) subdomen
+const GTM_ID = '5TCF99SP'; // From the settings tag
+const GTM_URL = 'https://data.farruxbek.online'; // First-party (custom) subdomain
 
 const sandbox_events = [
   'payment_info_submitted',
@@ -126,37 +121,36 @@ function extractNumericId(gid) {
 }
 
 // =======================================================================
-// QISM 1 — CONSENT MODE
+// PART 1 — CONSENT MODE
 // =======================================================================
 // Shopify Customer Privacy -> Google Consent Mode.
 //
-// Checkout'da Cookiebot (yoki boshqa tashqi CMP) UMUMAN ishlamaydi —
-// Shopify checkout'da uchinchi tomon skriptlariga ruxsat bermaydi. Shuning
-// uchun bu yerda consent manbai FAQAT Shopify'ning o'z native Customer
-// Privacy API'si:
-//   - initContext.customerPrivacy      -> boshlang'ich (default) holat
-//   - customerPrivacy.subscribe(...)   -> keyingi o'zgarishlar
-// Bu Shopify Admin -> Settings -> Customer Privacy sozlamalariga bog'liq,
-// Cookiebot sozlamalariga EMAS — ikkalasi mos kelishini alohida tekshiring
-// (Cookiebot -> Settings -> Shopify integration yoqilganmi).
+// Third-party CMPs (e.g. Cookiebot) do NOT run on checkout at all —
+// Shopify doesn't allow third-party scripts there. So the only consent
+// source here is Shopify's own native Customer Privacy API:
+//   - initContext.customerPrivacy      -> initial (default) state
+//   - customerPrivacy.subscribe(...)   -> subsequent changes
+// This depends on Shopify Admin -> Settings -> Customer Privacy, NOT on
+// your CMP's own settings — verify the two are aligned separately.
 //
-// TEKSHIRISH (bu qismni qo'shgandan keyin, checkout'da konsolni oching):
-//   1. "CONSENT: initial privacy snapshot" logini toping — customerPrivacy
-//      obyekti kelayotganini tasdiqlaydi (undefined bo'lsa — muammo shu
-//      yerda, keyingi qadamga o'tmang).
-//   2. "CONSENT: gtag default pushed" logini toping — qaysi qiymatlar
-//      (granted/denied) yuborilganini ko'rasiz.
-//   3. Checkout'da consent banner ko'rsatilsa va tanlov qilsangiz —
-//      "CONSENT: gtag update pushed" logi chiqishi kerak.
+// VERIFYING (after adding this piece, open the console on checkout):
+//   1. Look for the "CONSENT: initial privacy snapshot" log — confirms a
+//      real customerPrivacy object is arriving (if undefined, the problem
+//      is right here — don't move to the next step yet).
+//   2. Look for the "CONSENT: default pushed" log — shows exactly which
+//      values (granted/denied) were sent.
+//   3. If checkout shows a consent banner and you interact with it —
+//      "CONSENT: update pushed" should fire.
 
 window.dataLayer = window.dataLayer || [];
 
-// gtag() shim — GTM'ning o'z ichki Consent Mode protokoliga mos formatda
-// dataLayer'ga "consent" buyrug'ini yozadi. Bu window.dataLayer.push(obj)
-// bilan bir xil massivga yoziladi, lekin GTM buni maxsus (arguments-style)
-// formatda tanib, o'zining native consent mexanizmini ishga tushiradi.
+// gtag() shim — writes a "consent" command into dataLayer in the exact
+// format GTM's own internal Consent Mode protocol expects. It lands in
+// the same array as window.dataLayer.push(obj), but GTM recognizes this
+// specific (arguments-style) shape and runs its native consent machinery
+// on it.
 function gtag() {
-  if (isLog) console.log('CONSENT: gtag() chaqirildi', arguments);
+  if (isLog) console.log('CONSENT: gtag() called', arguments);
   window.dataLayer.push(arguments);
 }
 
@@ -170,36 +164,36 @@ function mapConsentToGtag(privacy) {
     ad_personalization: marketing ? 'granted' : 'denied',
     analytics_storage: analyticsOk ? 'granted' : 'denied',
     personalization_storage: preferences ? 'granted' : 'denied',
-    // Bular odatda har doim "granted" — saytning texnik ishlashi va
-    // xavfsizligi uchun zarur, consent'ga bog'liq emas.
+    // These are normally always "granted" — required for the site's
+    // basic technical operation and security, not gated by consent.
     functionality_storage: 'granted',
     security_storage: 'granted'
   };
 }
 
-// Server tomonida aniq filtr qo'yish uchun (GTM'ning "ko'rinmas" ichki
-// holatiga ishonib o'tirmasdan), so'nggi ma'lum consent holatini shu
-// yerda saqlab boramiz — har bir event payload'iga ANIQ MAYDON sifatida
-// qo'shib yuboramiz (pastda, prepareDataLayerObject ichida).
+// Kept here so we can apply an explicit, server-side-checkable filter
+// instead of relying on GTM's "invisible" internal consent state — the
+// last known consent state is tracked and attached to every event
+// payload as an explicit field (see prepareDataLayerObject below).
 let currentConsentState = null;
 
 function initConsentMode() {
   const initialPrivacy = initContext?.customerPrivacy;
-  if (isLog) console.log('CONSENT: boshlang\'ich privacy snapshot', initialPrivacy);
+  if (isLog) console.log('CONSENT: initial privacy snapshot', initialPrivacy);
 
-  // 1) Boshlang'ich holatni GTM konteyner yuklanishidan OLDIN joylashtiramiz.
-  //    Bu SHART — aks holda GTM yuklangan zahoti ishga tushadigan tag'lar
-  //    (masalan GA4 config) consent holatisiz otilib ketishi mumkin.
+  // 1) Set the default state BEFORE the GTM container loads. This is
+  //    required — otherwise tags that fire the instant GTM initializes
+  //    (e.g. the GA4 config tag) could fire without any consent state.
   const defaultConsent = mapConsentToGtag(initialPrivacy);
   currentConsentState = defaultConsent;
   gtag('consent', 'default', Object.assign({}, defaultConsent, { wait_for_update: 500 }));
-  if (isLog) console.log('CONSENT: default yuborildi ->', defaultConsent);
+  if (isLog) console.log('CONSENT: default pushed ->', defaultConsent);
 
-  // 2) Consent keyinchalik o'zgarsa (checkout'da ham banner ko'rsatilishi
-  //    mumkin bo'lgan hududlarda) — yangilanishni GTM'ga yetkazamiz VA
-  //    saqlab qo'yamiz, keyingi eventlar shu yangilangan holatni olsin.
+  // 2) If consent changes later (checkout may show a banner in some
+  //    regions too) — forward the update to GTM AND keep it stored, so
+  //    subsequent events pick up the updated state.
   if (typeof customerPrivacy === 'undefined' || !customerPrivacy?.subscribe) {
-    if (isLog) console.warn('CONSENT: customerPrivacy.subscribe topilmadi — faqat default bilan qolamiz');
+    if (isLog) console.warn('CONSENT: customerPrivacy.subscribe not found — staying on default only');
     return;
   }
 
@@ -207,7 +201,7 @@ function initConsentMode() {
     const updatedConsent = mapConsentToGtag(event?.customerPrivacy);
     currentConsentState = updatedConsent;
     gtag('consent', 'update', updatedConsent);
-    if (isLog) console.log('CONSENT: update yuborildi ->', updatedConsent, 'raw:', event?.customerPrivacy);
+    if (isLog) console.log('CONSENT: update pushed ->', updatedConsent, 'raw:', event?.customerPrivacy);
   });
 }
 
@@ -223,61 +217,59 @@ function extractMarketData(event) {
 }
 
 /**
- * event_id generatori — bitta yagona manba (single source of truth).
- * Bu funksiya natijasi to'g'ridan-to'g'ri dataLayer obyektiga yoziladi va
- * GTM'dagi barcha tag'lar (pixel ham, server Data Tag ham) shu bitta
- * qiymatni o'qiydi.
+ * event_id generator — single source of truth. This function's result is
+ * written directly into the dataLayer object, and every tag in GTM
+ * (client pixel and server Data Tag alike) reads that same value.
  */
 function generateEventId(event, eventName) {
   if (eventName === 'checkout_completed') {
-    // Purchase — order.id asosida BARQAROR id. Sahifa qayta yuklansa ham
-    // xuddi shu id qaytadi -> reklama tizimlari dedup qilib, sotuvni
-    // ikki marta hisoblamaydi.
+    // Purchase — a STABLE id derived from order.id. Even if the page
+    // reloads, the same id comes back -> ad platforms deduplicate it and
+    // never double-count the sale.
     const orderId = extractNumericId(event?.data?.checkout?.order?.id);
     if (orderId) return 'purchase_' + orderId;
-    // order.id hali kelmagan juda kam holat uchun zaxira variant:
+    // Rare fallback if order.id hasn't arrived yet:
     return 'purchase_' + (event?.data?.checkout?.token || event.id);
   }
 
-  // Qolgan barcha eventlar — Shopify'ning o'zi har bir dispatch uchun
-  // kafolatlaydigan event.id'dan foydalanamiz.
+  // Every other event — use the event.id Shopify guarantees is unique
+  // per dispatch.
   return eventName + '_' + event.id;
 }
 
 // =======================================================================
-// QISM 2 — MARKETING COOKIE'LARNI O'QISH (fbc, fbp, gclid, ttp)
+// PART 2 — READING MARKETING COOKIES (fbc, fbp, gclid, gbraid, ttp)
 // =======================================================================
-// Checkout sandbox'da document.cookie ISHLAMAYDI — u undefined qaytaradi
-// (bu Shopify'ning o'z rasmiy hujjatida tasdiqlangan). O'rniga Shopify
-// ASINXRON, sanktsiyalangan API beradi: browser.cookie.get(name) ->
-// Promise<string>. Bu HAQIQIY top-frame cookie jar'iga (proksi orqali)
-// chiqadi — ya'ni bu yerdagi qiymat HAQIQIY, sandbox'ning o'z ichki
-// (izolyatsiya qilingan) cookie'si emas.
+// document.cookie does NOT work in the checkout sandbox — it returns
+// undefined (this is confirmed in Shopify's own official documentation).
+// Instead, Shopify provides an ASYNC, sanctioned API:
+// browser.cookie.get(name) -> Promise<string>. This reaches the REAL
+// top-frame cookie jar (through a proxy) — so the value read here is
+// REAL, not the sandbox's own isolated cookie.
 //
-// _gcl_aw formati: "GCL.<vaqt>.<gclid>" — gclid'ni olish uchun nuqta (.)
-// bo'yicha bo'lib, ENG OXIRGI qismini olamiz.
+// _gcl_aw format: "GCL.<timestamp>.<value>" — to get the value, we split
+// on the dot (.) and take EVERYTHING after the SECOND dot.
 //
-// TEKSHIRISH: checkout'da konsolda "COOKIE: o'qilgan qiymatlar ->" logini
-// qidiring. Agar fbc/fbp/gclid barchasi `null` chiqsa — bu ODDIY holat
-// bo'lishi mumkin (mijoz reklama orqali kelmagan bo'lsa, bu cookie'lar
-// umuman mavjud emas) — xato emas. Xavotir faqat shundaki, agar siz BILA
-// TURIB reklama linkidan sinov o'tkazgan bo'lsangiz-u, baribir `null`
-// chiqsa.
+// VERIFYING: on checkout, look for the "COOKIE: values read ->" log in
+// the console. If fbc/fbp/gclid all come back `null`, that can be a
+// perfectly normal outcome (if the customer didn't arrive via an ad,
+// those cookies simply never exist) — not a bug. Only worth worrying
+// about if you deliberately tested via an ad link and it's still null.
 
 async function safeGetCookie(name) {
   try {
     const value = await browser.cookie.get(name);
     return value || null;
   } catch (err) {
-    if (isLog) console.warn('COOKIE: "' + name + '" o\'qilmadi ->', err);
+    if (isLog) console.warn('COOKIE: "' + name + '" could not be read ->', err);
     return null;
   }
 }
 
-// "GCL.<vaqt>.<qiymat>" formatidan qiymatni ajratib olish. Oxirgi
-// bo'lakni emas, IKKINCHI nuqtadan keyingi HAMMA qismini olamiz — chunki
-// gclid/gbraid'ning o'zi nazariy jihatdan nuqta belgisini o'z ichiga
-// olishi mumkin, oxirgi bo'lakni olish bu holda uni qirqib tashlaydi.
+// Extracts the value from a "GCL.<timestamp>.<value>" format. We take
+// everything after the SECOND dot rather than the last segment, because
+// gclid/gbraid can in theory contain a dot themselves — taking only the
+// last segment would truncate it in that case.
 function extractAfterSecondDot(raw) {
   if (!raw) return null;
   const firstDot = raw.indexOf('.');
@@ -290,17 +282,18 @@ function extractAfterSecondDot(raw) {
 
 async function getMarketingCookies() {
   if (typeof browser === 'undefined' || !browser?.cookie?.get) {
-    if (isLog) console.warn('COOKIE: browser.cookie mavjud emas — bo\'sh qiymatlar bilan davom etamiz');
+    if (isLog) console.warn('COOKIE: browser.cookie is not available — continuing with empty values');
     return { fbc: null, fbp: null, gclid: null, gcl_aw_raw: null, gbraid: null, gcl_gb_raw: null, ttp: null };
   }
 
-  // Barcha cookie'larni PARALLEL o'qiymiz (Promise.all) — ketma-ket
-  // o'qisak, har birining kutish vaqti qo'shilib, umumiy kechikish oshadi.
+  // Read all cookies in PARALLEL (Promise.all) — reading them
+  // sequentially would add each one's wait time on top of the last,
+  // increasing total latency.
   const [fbc, fbp, gclAw, gclGb, ttp] = await Promise.all([
     safeGetCookie('_fbc'),
     safeGetCookie('_fbp'),
-    safeGetCookie('_gcl_aw'),   // gclid shu yerda
-    safeGetCookie('_gcl_gb'),   // gbraid shu yerda (iOS/app kampaniyalari)
+    safeGetCookie('_gcl_aw'),   // gclid lives here
+    safeGetCookie('_gcl_gb'),   // gbraid lives here (iOS/app campaigns)
     safeGetCookie('_ttp')
   ]);
 
@@ -312,22 +305,25 @@ async function getMarketingCookies() {
     gbraid, gcl_gb_raw: gclGb
   };
 
-  if (isLog) console.log('COOKIE: o\'qilgan qiymatlar ->', result);
+  if (isLog) console.log('COOKIE: values read ->', result);
   return result;
 }
 
-// wbraid uchun aniq, keng tarqalgan cookie nomi topilmadi (past ishonch) —
-// shuning uchun buni faqat URL'dan o'qiymiz. UTM parametrlari ham xuddi
-// shunday: standart cookie yo'q, faqat checkout URL'ida saqlanib qolgan
-// bo'lsa o'qiladi. KO'P HOLLARDA BULAR `null` BO'LISHI KUTILGAN — checkout
-// paytiga kelib bu parametrlar odatda URL'dan yo'qolgan bo'ladi (agar
-// tema o'zi maxsus saqlamasa). Xato emas, faqat cheklov.
+// No well-documented, widely-recognized cookie name was found for
+// wbraid specifically (low confidence) — so we only read it from the
+// URL. UTM parameters work the same way: there's no standard cookie for
+// these either; they're only read if they happen to still be present in
+// the checkout URL. IN MOST CASES THESE ARE EXPECTED TO BE `null` — by
+// the time checkout is reached, these parameters have usually already
+// disappeared from the URL (unless persisted, see the ATTRIBUTION
+// PERSISTENCE section below for how we work around this). Not a bug,
+// just a limitation of URL-only reading.
 function getUrlBasedSignals(url) {
   let params;
   try {
     params = new URL(url).searchParams;
   } catch (err) {
-    if (isLog) console.warn('URL: parse qilinmadi ->', url, err);
+    if (isLog) console.warn('URL: could not be parsed ->', url, err);
     return { wbraid: null, utm_source: null, utm_medium: null, utm_campaign: null, utm_term: null, utm_content: null };
   }
 
@@ -340,19 +336,34 @@ function getUrlBasedSignals(url) {
     utm_content: params.get('utm_content') || null,
   };
 
-  if (isLog) console.log('URL: signallar ->', result);
+  if (isLog) console.log('URL: signals ->', result);
   return result;
 }
 
 // =======================================================================
-// ATTRIBUTION (UTM + Click-ID) PERSISTENCE — browser.localStorage
+// PART 3 — ATTRIBUTION (UTM + Click-ID) PERSISTENCE via browser.localStorage
 // =======================================================================
-// Storefront'da UTM/click-ID URL'da bo'ladi, lekin checkout URL'ida
-// yo'qoladi. Shu sababli localStorage ga saqlab, checkout'da tiklaymiz.
-// 30 daqiqa TTL — reklama attribusiyasi uchun standart.
+// UTM/click-ID parameters live in the URL on the storefront, but they're
+// gone by the time the customer reaches checkout. To bridge that gap, we
+// persist them to localStorage (via Shopify's sanctioned async
+// browser.localStorage API, which reaches the real top-frame storage,
+// same as browser.cookie) and restore them at checkout.
+//
+// This piggybacks on the EXISTING page_viewed subscription that already
+// runs on every storefront page (see the `else` branch further down) —
+// no separate theme script or code on the storefront is required. When
+// a storefront page_viewed event carries UTM/click-ID parameters in its
+// URL, they get merged into localStorage; at checkout, we simply read
+// whatever's there (within the TTL window).
+//
+// 30-minute TTL — a reasonable default for session-scoped attribution.
+// If your typical browse-to-checkout time is longer, consider raising
+// ATTR_TTL_MS (note this is shorter than typical 7–28 day ad-platform
+// click windows — this only bridges the storefront-to-checkout gap
+// within a single session, not long-term attribution).
 
 const ATTR_KEY = 'shopify_pixel_attr_v1';
-const ATTR_TTL_MS = 30 * 60 * 1000; // 30 daqiqa
+const ATTR_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 async function persistAttribution(url) {
   try {
@@ -370,6 +381,9 @@ async function persistAttribution(url) {
       fbclid: params.get('fbclid'),
       wbraid: params.get('wbraid'),
     };
+    // Only overwrite a stored field if the fresh URL actually has a
+    // value for it — a param missing from the new URL doesn't erase a
+    // previously captured one.
     const merged = { ...stored };
     for (const [key, value] of Object.entries(fresh)) {
       if (value !== null && value !== undefined && value !== '') {
@@ -378,9 +392,9 @@ async function persistAttribution(url) {
     }
     merged.saved_at = Date.now();
     await browser.localStorage.setItem(ATTR_KEY, JSON.stringify(merged));
-    if (isLog) console.log('ATTR: saqlandi ->', merged);
+    if (isLog) console.log('ATTR: saved ->', merged);
   } catch (err) {
-    if (isLog) console.warn('ATTR: saqlashda xato ->', err);
+    if (isLog) console.warn('ATTR: error while saving ->', err);
   }
 }
 
@@ -391,13 +405,13 @@ async function getAttribution() {
     const parsed = JSON.parse(raw);
     if (Date.now() - (parsed.saved_at || 0) > ATTR_TTL_MS) {
       await browser.localStorage.removeItem(ATTR_KEY);
-      if (isLog) console.log('ATTR: 30 daqiqa o\'tdi, tozalandi');
+      if (isLog) console.log('ATTR: 30 minutes elapsed, cleared');
       return {};
     }
     const { saved_at, ...rest } = parsed;
     return rest;
   } catch (err) {
-    if (isLog) console.warn('ATTR: o\'qishda xato ->', err);
+    if (isLog) console.warn('ATTR: error while reading ->', err);
     return {};
   }
 }
@@ -415,26 +429,28 @@ async function prepareDataLayerObject(event, eventName) {
   const market = extractMarketData(event);
   const marketingCookies = await getMarketingCookies();
 
-  // === URL tozalash (oxiridagi ] belgisi) ===
- const rawUrl = event?.context?.document?.location?.href ||
+  // === URL cleanup (strip a stray trailing "]" observed in testing) ===
+  // NOTE: root cause not fully confirmed, but this sanitization was found
+  // to be empirically necessary — kept as a defensive safeguard.
+  const rawUrl = event?.context?.document?.location?.href ||
     initContext?.context?.document?.location?.href ||
     href;
   const currentUrl = rawUrl.replace(/\]$/, '');
 
-  // === URL'dan joriy parametrlar ===
+  // === Attribution parameters from the current URL ===
   const urlParams = new URL(currentUrl).searchParams;
   const currentUtmSource = urlParams.get('utm_source');
   const currentGclid = urlParams.get('gclid');
 
-  // === Storefront'da yangi attribution bo'lsa -> saqlash ===
+  // === If the storefront URL carries fresh attribution, persist it ===
   if (currentUtmSource || currentGclid || urlParams.get('utm_medium') || urlParams.get('fbclid') || urlParams.get('wbraid')) {
     await persistAttribution(currentUrl);
   }
 
-  // === localStorage'dan eski attribution (checkout fallback) ===
+  // === Restore previously stored attribution (checkout fallback) ===
   const stored = await getAttribution();
 
-  // === Yakuniy merge: URL > localStorage > cookie (gclid uchun) > null ===
+  // === Final merge priority: current URL > localStorage > cookie (gclid only) > null ===
   const utm_source = currentUtmSource || stored.utm_source || null;
   const utm_medium = urlParams.get('utm_medium') || stored.utm_medium || null;
   const utm_campaign = urlParams.get('utm_campaign') || stored.utm_campaign || null;
@@ -455,13 +471,13 @@ async function prepareDataLayerObject(event, eventName) {
     cart_state,
     ecomm_pagetype,
     actual_url: currentUrl,
-    // QISM 2: marketing click-ID'lari
+    // PART 2: marketing click-IDs
     fbc: marketingCookies.fbc,
     fbp: marketingCookies.fbp,
     gclid: gclid,
     gbraid: marketingCookies.gbraid,
     ttp: marketingCookies.ttp,
-    // QISM 2b: URL asosidagi signallar + localStorage fallback
+    // PART 2b: URL-based signals + localStorage fallback
     wbraid: wbraid,
     utm_source: utm_source,
     utm_medium: utm_medium,
@@ -469,7 +485,7 @@ async function prepareDataLayerObject(event, eventName) {
     utm_term: utm_term,
     utm_content: utm_content,
     fbclid: fbclid,
-    // Server tomonida ANIQ filtr qo'yish uchun
+    // For an explicit, server-side-checkable filter
     consent: event?.consent || currentConsentState,
   };
 
@@ -528,14 +544,17 @@ async function handleAnalyticsEvent(event) {
 
   const pushData = () => {
     if (isCheckoutPage) {
-      // Checkout sahifasi: hammasini dataLayer'ga yozamiz
+      // Checkout page: push everything to dataLayer
       window.dataLayer = window.dataLayer || [];
       window.dataLayer.push(data);
     } else if (isPageViewed) {
-      // Checkout bo'lmagan sahifa: faqat page_viewed'ni parent'ga uzatamiz
+      // Non-checkout page: only relay page_viewed to the parent window
+      // (this is also where attribution gets captured into localStorage,
+      // see PART 3 above — persistAttribution runs inside
+      // prepareDataLayerObject for every storefront page_viewed)
       window.parent.postMessage(data, location.origin);
     }
-    // Boshqa hollarda checkout'dan tashqarida push qilinmaydi
+    // No push happens for other event types outside checkout
   };
 
   setTimeout(pushData, 500);
@@ -556,12 +575,12 @@ if (canSubscribe) {
         loadGTM(marketId);
       }
       if (sandbox_events.includes(event.name) || event.name === 'page_viewed') {
-        handleAnalyticsEvent(event).catch((err) => console.error('handleAnalyticsEvent xatosi:', err));
+        handleAnalyticsEvent(event).catch((err) => console.error('handleAnalyticsEvent error:', err));
       }
     });
   } else {
     analytics.subscribe("page_viewed", (event) => {
-      handleAnalyticsEvent(event).catch((err) => console.error('handleAnalyticsEvent xatosi:', err));
+      handleAnalyticsEvent(event).catch((err) => console.error('handleAnalyticsEvent error:', err));
     });
   }
 }
@@ -578,31 +597,31 @@ function getPageType() {
   else { return 'other'; }
 }
 // -----------------------------------------------------------------------
-// loadGTM — Stape'ning first-party (custom subdomain) GTM loader kodi.
-// Bu qism o'zgartirilmadi — u allaqachon sizning shaxsiy subdomeningiz
-// (data.farruxbek.online) orqali ishlaydi, shuning uchun adblocker'ga
-// chidamli. Faqat shu funksiyagina qoldirildi, sp.stapecdn.com'ga fetch
-// qiluvchi eski wrapper butunlay olib tashlandi.
+// loadGTM — Stape's first-party (custom subdomain) GTM loader code. This
+// part is unchanged in behavior — it already runs through your own
+// personal subdomain (data.farruxbek.online), so it's resistant to
+// adblockers. Only this function remains from Stape's original
+// implementation; the old wrapper that fetched from sp.stapecdn.com has
+// been fully removed.
 // -----------------------------------------------------------------------
 function loadGTM(key) {
 
   if (isInsertGTM) return;
   isInsertGTM = true;
 
-  // Eslatma: avval bu yerda `key` (market ID) bo'yicha 3 xil `case` bor edi,
-  // lekin ularning uchalasi ham baytma-bayt bir xil edi va useMultyMarkets
-  // hozir `false` bo'lgani uchun bari bir `default`ga tushar edi — dead
-  // code sifatida olib tashlandi.
+  // Note: this used to have 3 different `case` branches keyed by `key`
+  // (market ID), but all three were byte-for-byte identical, and since
+  // useMultyMarkets is currently `false`, execution always fell through
+  // to `default` anyway — the duplicated dead code was removed.
   //
-  // Quyidagi kod — Stape'ning minifikatsiya qilingan GTM loader snippet'i
-  // BUTUNLAY BIR XIL MANTIQ bilan, lekin o'qiladigan, to'qnashmaydigan
-  // o'zgaruvchi nomlari bilan qayta yozilgan. Sabab: minifikatsiya paytida
-  // bir xil qisqa nom (d, g, v, E, f) bitta funksiya ichida ikki marta
-  // qayta ishlatilgan edi — bu JS'da texnik jihatdan xato emas (`var` shu
-  // tarzda qayta e'lon qilinaveradi), lekin Shopify muharriridagi
-  // tekshiruvchi buni "already defined" / "used out of scope" deb
-  // belgilardi. Har bir qadam original bilan solishtirib tekshirildi —
-  // domen, konteyner ID va so'rov satri (query string) o'zgarishsiz qoldi.
+  // The code below is Stape's minified GTM loader snippet, rewritten
+  // with THE EXACT SAME LOGIC but with readable, non-colliding variable
+  // names. Reason: during minification, the same short name (d, g, v, E,
+  // f) was reused twice within a single function — this isn't a JS error
+  // (`var` allows redeclaration like this), but Shopify's editor checker
+  // flagged it as "already defined" / "used out of scope". Every step
+  // was checked against the original — the domain, container ID, and
+  // query string are unchanged.
   !function () {
     "use strict";
 
@@ -648,7 +667,7 @@ function loadGTM(key) {
       }
     }
 
-    // ---- Stape konfiguratsiyasi (original qiymatlar, o'zgartirilmagan) ----
+    // ---- Stape configuration (original values, unchanged) ----
     var GTM_LOADER_DOMAIN = "https://data.farruxbek.online";
     var GTM_LOADER_DOMAIN_FALLBACK = "";
     var CONTAINER_ID = "3sibtwmwlxmfa";
