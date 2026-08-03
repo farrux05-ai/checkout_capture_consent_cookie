@@ -3,74 +3,88 @@
  * CUSTOM PIXEL — Checkout Events → Stape GTM (first-party subdomain)
  * ============================================================================
  *
- * WHAT CHANGED AND WHY:
- *
- * 1) The fetch() call to Stape App's shared CDN (sp.stapecdn.com) was
- *    removed entirely. That domain is shared across every Stape customer,
- *    so it frequently ends up on adblock lists (EasyList/EasyPrivacy) — if
- *    blocked, the subscribe() call inside the .then() never runs and
- *    nothing gets tracked. Instead, only loadGTM() remains, which loads
- *    the GTM container from your own first-party subdomain
- *    (data.farruxbek.online). This is far more resistant to blockers,
- *    since it isn't a shared, publicly known tracking domain.
- *
- * 2) event_id is now generated in exactly one place and written to the
- *    dataLayer object once (generateEventId()). A single dataLayer.push()
- *    means both the client-side pixel tag (Facebook/TikTok Pixel by
- *    Stape) and the server Data Tag read the identical event_id from the
- *    same dataLayer entry — so both sides always match. Previously, when
- *    Stape auto-generated the ID itself in a hybrid setup, the two sides
- *    generated two different IDs, breaking deduplication. That's fixed now.
- *
- * 3) For checkout_completed (purchase), event_id is built from the STABLE
- *    order ID (not random). Reason: if the thank-you page reloads (F5,
- *    back/forward), checkout_completed can fire again. With a random ID,
- *    Meta/TikTok/GA4 would count that as a second purchase, inflating
- *    ROAS/sales numbers. Since the order ID never changes, the replayed
- *    event carries the same event_id and ad platforms deduplicate it
- *    automatically — one order = one conversion, no matter how many times
- *    the page reloads.
- *
- * 4) For every other event (add_payment_info, begin_checkout, etc.), we
- *    use event.id, which Shopify guarantees is unique per dispatch (per
- *    the Web Pixels API). There's no need to mint our own
- *    crypto.randomUUID() — what matters is that this value is read once,
- *    here, and written into a single dataLayer object, not generated
- *    twice.
+ * ORIGINAL CHANGES (v1):
+ * 1) Removed fetch() to Stape App's shared CDN (sp.stapecdn.com) — adblock risk.
+ *    Only loadGTM() remains, loading GTM from your first-party subdomain.
+ * 2) event_id is generated in exactly one place (generateEventId()) and written
+ *    to the dataLayer once, so client pixel tags and the server Data Tag always
+ *    read the same value — required for correct Meta/TikTok deduplication.
+ * 3) checkout_completed (purchase) uses a STABLE event_id built from order.id,
+ *    so a thank-you page reload never double-counts a purchase.
+ * 4) Every other event uses event.id (Shopify guarantees uniqueness per
+ *    dispatch per the Web Pixels API).
  *
  * ----------------------------------------------------------------------------
- * REQUIRED GTM-SIDE SETUP (for this code to work):
+ * UPDATE 2 — THIS PASS:
  *
- *   a) In GTM, create a new Data Layer Variable, e.g. named
- *      "DLV - event_id", with Data Layer Variable Name: event_id
+ * A) ATTRIBUTION PERSISTENCE MOVED FROM localStorage TO A COOKIE KEEPER
+ *    CUSTOM COOKIE.
+ *    The old PART 3 wrote UTM/click-ID params into browser.localStorage with
+ *    a hardcoded 30-minute TTL. That's fragile: it only bridges a single
+ *    session on the same device, and it re-invents what Stape's Cookie
+ *    Keeper power-up already does properly (extends cookie lifetime past
+ *    Safari ITP's cap, restores cookies via a server response so the
+ *    checkout sandbox can see them).
+ *    Now we write the SAME attribution data into a first-party cookie named
+ *    `_stape_attr` via browser.cookie.set(). You must add this exact name
+ *    (`_stape_attr`) as a "custom cookie" in Stape's Cookie Keeper power-up
+ *    panel (Power-ups → Cookie Keeper → Custom cookies) so Stape keeps
+ *    extending/restoring it the same way it already does for _fbp, _fbc,
+ *    _gcl_aw, _gcl_gb, _ttp. Set an expiration there that matches your
+ *    attribution window (e.g. 30 days) — you no longer need to hardcode a
+ *    TTL in this script.
  *
- *   b) In each of the following TAGS, bind the "Event ID" (or "event_id")
- *      field to {{DLV - event_id}}:
- *         - [Stape] Meta - AddPaymentInfo / AddToCart / InitiateCheckout /
- *           PageView / Purchase / Search / ViewContent
- *         - [Stape] TikTok - (same list)
- *         - [Stape] DT - * (Data Tags — these carry event_id through Stape
- *           Client to the server container, where the Meta CAPI / TikTok
- *           Events API tags must also read this same event_id)
+ * B) EACH DATALAYER FIELD IS NOW ITS OWN NAMED VARIABLE.
+ *    prepareDataLayerObject() used to build most fields inline inside one
+ *    big object literal. Every core field (event_id, user_data, actual_url,
+ *    gclid, fbclid, etc.) is now computed into its own const first, and the
+ *    object literal just references them. Easier to console.log or debug
+ *    any single field in isolation.
  *
- *   c) If any of these tags has an "Auto-generate Event ID" toggle (or
- *      similar), turn it OFF. Otherwise Stape may generate an additional
- *      ID of its own, either overwriting or duplicating alongside the
- *      exact event_id we already set.
+ * C) UTM PARAMETERS ARE NO LONGER SEPARATE DATALAYER FIELDS.
+ *    utm_source / utm_medium / utm_campaign / utm_term / utm_content used to
+ *    be five separate keys in the pushed object. They are now appended as
+ *    query parameters onto `actual_url` instead (only if not already
+ *    present there). Your server container (GA4 / Ads tags that read
+ *    page_location, or a URL-parsing variable in sGTM) can keep extracting
+ *    them from the URL exactly like it already does for a normal
+ *    client-side hit — one field carries everything, and there's one fewer
+ *    thing that can silently go missing on a specific tag.
+ *    Click IDs (gclid, fbclid, wbraid) are NOT folded into the URL — Ads/
+ *    Meta CAPI-style server tags usually expect these as dedicated fields
+ *    for exact matching, so they stay as their own variables below.
  *
- *   d) In Shopify Admin → Settings → Customer events, check whether Stape
- *      App's own auto-installed Web Pixel (the one with the
- *      fetch(sp.stapecdn.com...) code) is still active. If so, disable or
- *      remove it — otherwise two pixels run simultaneously, the GTM
- *      container loads twice, and every event fires twice (duplicated).
+ * D) CONSENT SUBSCRIBE FIX.
+ *    The bare `customerPrivacy` global is not guaranteed in the Custom
+ *    Pixel code-editor context — Shopify's own docs only list analytics,
+ *    browser and init as pre-deconstructed. Real working examples call
+ *    `api.customerPrivacy.subscribe(...)` off the global `api` object
+ *    instead. getCustomerPrivacyApi() below now tries the bare global
+ *    first (in case Shopify ever exposes it directly) and falls back to
+ *    `api.customerPrivacy`. If BOTH are missing, the most common secondary
+ *    cause is a CMP that deletes Shopify's own `_tracking_consent` cookie —
+ *    the Customer Privacy API reads its state from that cookie, so if your
+ *    CMP purges it, the API silently stops working. Worth excluding
+ *    `_tracking_consent` from any cookie-blocking rule in your CMP.
+ *
+ * ----------------------------------------------------------------------------
+ * REQUIRED GTM-SIDE SETUP (unchanged from v1):
+ *
+ *   a) In GTM, create a Data Layer Variable "DLV - event_id" (Data Layer
+ *      Variable Name: event_id).
+ *   b) In every Meta / TikTok / Data Tag, bind "Event ID" to
+ *      {{DLV - event_id}}, and turn off any "Auto-generate Event ID" toggle.
+ *   c) In Shopify Admin → Settings → Customer events, disable/remove
+ *      Stape App's own auto-installed pixel if it's still active — two
+ *      pixels running together will double every event.
+ *
+ * REQUIRED STAPE-SIDE SETUP (new, for this pass):
+ *
+ *   d) Power-ups → Cookie Keeper → Custom cookies → add cookie name
+ *      `_stape_attr`, set an expiration (e.g. 30 days).
  * ============================================================================
  */
 
-// The Shopify Custom Pixel editor provides `analytics`, `browser`, and
-// `init` objects ready to use (no register() wrapper needed) — so we use
-// them directly rather than through window. This also helps Shopify's own
-// static checker recognize the "analytics.subscribe(...)" call more
-// reliably (this is how the official examples write it too).
 const initContext = init;
 
 const GTM_ID = '5TCF99SP'; // From the settings tag
@@ -129,26 +143,23 @@ function extractNumericId(gid) {
 // Shopify doesn't allow third-party scripts there. So the only consent
 // source here is Shopify's own native Customer Privacy API:
 //   - initContext.customerPrivacy      -> initial (default) state
-//   - customerPrivacy.subscribe(...)   -> subsequent changes
+//   - customerPrivacy.subscribe(...)   -> subsequent changes (see
+//     getCustomerPrivacyApi() below for how this is actually resolved)
 // This depends on Shopify Admin -> Settings -> Customer Privacy, NOT on
 // your CMP's own settings — verify the two are aligned separately.
 //
 // VERIFYING (after adding this piece, open the console on checkout):
-//   1. Look for the "CONSENT: initial privacy snapshot" log — confirms a
-//      real customerPrivacy object is arriving (if undefined, the problem
-//      is right here — don't move to the next step yet).
-//   2. Look for the "CONSENT: default pushed" log — shows exactly which
-//      values (granted/denied) were sent.
-//   3. If checkout shows a consent banner and you interact with it —
+//   1. Look for "CONSENT: initial privacy snapshot" — confirms a real
+//      customerPrivacy object is arriving.
+//   2. Look for "CONSENT: default pushed" — shows exactly which values
+//      (granted/denied) were sent.
+//   3. Look for "CONSENT: subscribed via <source>" — confirms which of the
+//      two access paths worked (bare global vs api.customerPrivacy).
+//   4. If checkout shows a consent banner and you interact with it —
 //      "CONSENT: update pushed" should fire.
 
 window.dataLayer = window.dataLayer || [];
 
-// gtag() shim — writes a "consent" command into dataLayer in the exact
-// format GTM's own internal Consent Mode protocol expects. It lands in
-// the same array as window.dataLayer.push(obj), but GTM recognizes this
-// specific (arguments-style) shape and runs its native consent machinery
-// on it.
 function gtag() {
   if (isLog) console.log('CONSENT: gtag() called', arguments);
   window.dataLayer.push(arguments);
@@ -164,40 +175,71 @@ function mapConsentToGtag(privacy) {
     ad_personalization: marketing ? 'granted' : 'denied',
     analytics_storage: analyticsOk ? 'granted' : 'denied',
     personalization_storage: preferences ? 'granted' : 'denied',
-    // These are normally always "granted" — required for the site's
-    // basic technical operation and security, not gated by consent.
     functionality_storage: 'granted',
     security_storage: 'granted'
   };
 }
 
-// Kept here so we can apply an explicit, server-side-checkable filter
-// instead of relying on GTM's "invisible" internal consent state — the
-// last known consent state is tracked and attached to every event
-// payload as an explicit field (see prepareDataLayerObject below).
 let currentConsentState = null;
+
+/**
+ * Resolves a working customerPrivacy.subscribe() reference.
+ *
+ * Shopify's own docs (Web Pixels API) only guarantee analytics, browser,
+ * and init as pre-deconstructed globals in the Custom Pixel code editor —
+ * customerPrivacy is notably absent from that list. Working real-world
+ * pixel code instead calls it off the global `api` object:
+ * api.customerPrivacy.subscribe(...). We try the bare global first (in
+ * case a future Shopify version does expose it directly) and fall back to
+ * api.customerPrivacy.
+ */
+function getCustomerPrivacyApi() {
+  try {
+    if (typeof customerPrivacy !== 'undefined' && customerPrivacy && typeof customerPrivacy.subscribe === 'function') {
+      return { api: customerPrivacy, source: 'bare customerPrivacy global' };
+    }
+  } catch (e) {}
+
+  try {
+    if (typeof api !== 'undefined' && api?.customerPrivacy && typeof api.customerPrivacy.subscribe === 'function') {
+      return { api: api.customerPrivacy, source: 'api.customerPrivacy' };
+    }
+  } catch (e) {}
+
+  return null;
+}
 
 function initConsentMode() {
   const initialPrivacy = initContext?.customerPrivacy;
   if (isLog) console.log('CONSENT: initial privacy snapshot', initialPrivacy);
 
-  // 1) Set the default state BEFORE the GTM container loads. This is
-  //    required — otherwise tags that fire the instant GTM initializes
-  //    (e.g. the GA4 config tag) could fire without any consent state.
+  // 1) Default state BEFORE GTM loads — required so tags that fire the
+  //    instant GTM initializes don't fire without any consent state.
   const defaultConsent = mapConsentToGtag(initialPrivacy);
   currentConsentState = defaultConsent;
   gtag('consent', 'default', Object.assign({}, defaultConsent, { wait_for_update: 500 }));
   if (isLog) console.log('CONSENT: default pushed ->', defaultConsent);
 
-  // 2) If consent changes later (checkout may show a banner in some
-  //    regions too) — forward the update to GTM AND keep it stored, so
-  //    subsequent events pick up the updated state.
-  if (typeof customerPrivacy === 'undefined' || !customerPrivacy?.subscribe) {
-    if (isLog) console.warn('CONSENT: customerPrivacy.subscribe not found — staying on default only');
+  // 2) Live updates — resolve a working API reference instead of assuming
+  //    a bare `customerPrivacy` global exists.
+  const resolved = getCustomerPrivacyApi();
+
+  if (!resolved) {
+    if (isLog) {
+      console.warn(
+        'CONSENT: no working customerPrivacy API found (checked bare "customerPrivacy" ' +
+        'and "api.customerPrivacy") — staying on default only. If this keeps happening, ' +
+        'also check that your CMP is not deleting Shopify\'s own "_tracking_consent" cookie: ' +
+        'the Customer Privacy API reads its live state from that cookie, so a CMP that blocks ' +
+        'or clears it will make subscribe() silently do nothing even when the API object exists.'
+      );
+    }
     return;
   }
 
-  customerPrivacy.subscribe('visitorConsentCollected', (event) => {
+  if (isLog) console.log('CONSENT: subscribed via', resolved.source);
+
+  resolved.api.subscribe('visitorConsentCollected', (event) => {
     const updatedConsent = mapConsentToGtag(event?.customerPrivacy);
     currentConsentState = updatedConsent;
     gtag('consent', 'update', updatedConsent);
@@ -217,44 +259,26 @@ function extractMarketData(event) {
 }
 
 /**
- * event_id generator — single source of truth. This function's result is
- * written directly into the dataLayer object, and every tag in GTM
- * (client pixel and server Data Tag alike) reads that same value.
+ * event_id generator — single source of truth.
  */
 function generateEventId(event, eventName) {
   if (eventName === 'checkout_completed') {
-    // Purchase — a STABLE id derived from order.id. Even if the page
-    // reloads, the same id comes back -> ad platforms deduplicate it and
-    // never double-count the sale.
     const orderId = extractNumericId(event?.data?.checkout?.order?.id);
     if (orderId) return 'purchase_' + orderId;
-    // Rare fallback if order.id hasn't arrived yet:
     return 'purchase_' + (event?.data?.checkout?.token || event.id);
   }
-
-  // Every other event — use the event.id Shopify guarantees is unique
-  // per dispatch.
   return eventName + '_' + event.id;
 }
 
 // =======================================================================
 // PART 2 — READING MARKETING COOKIES (fbc, fbp, gclid, gbraid, ttp)
 // =======================================================================
-// document.cookie does NOT work in the checkout sandbox — it returns
-// undefined (this is confirmed in Shopify's own official documentation).
-// Instead, Shopify provides an ASYNC, sanctioned API:
-// browser.cookie.get(name) -> Promise<string>. This reaches the REAL
-// top-frame cookie jar (through a proxy) — so the value read here is
-// REAL, not the sandbox's own isolated cookie.
+// document.cookie does NOT work in the checkout sandbox. Instead, Shopify
+// provides an ASYNC, sanctioned API: browser.cookie.get(name) ->
+// Promise<string>, which reaches the REAL top-frame cookie jar.
 //
-// _gcl_aw format: "GCL.<timestamp>.<value>" — to get the value, we split
-// on the dot (.) and take EVERYTHING after the SECOND dot.
-//
-// VERIFYING: on checkout, look for the "COOKIE: values read ->" log in
-// the console. If fbc/fbp/gclid all come back `null`, that can be a
-// perfectly normal outcome (if the customer didn't arrive via an ad,
-// those cookies simply never exist) — not a bug. Only worth worrying
-// about if you deliberately tested via an ad link and it's still null.
+// _gcl_aw format: "GCL.<timestamp>.<value>" — value is everything after
+// the SECOND dot.
 
 async function safeGetCookie(name) {
   try {
@@ -266,10 +290,6 @@ async function safeGetCookie(name) {
   }
 }
 
-// Extracts the value from a "GCL.<timestamp>.<value>" format. We take
-// everything after the SECOND dot rather than the last segment, because
-// gclid/gbraid can in theory contain a dot themselves — taking only the
-// last segment would truncate it in that case.
 function extractAfterSecondDot(raw) {
   if (!raw) return null;
   const firstDot = raw.indexOf('.');
@@ -286,207 +306,184 @@ async function getMarketingCookies() {
     return { fbc: null, fbp: null, gclid: null, gcl_aw_raw: null, gbraid: null, gcl_gb_raw: null, ttp: null };
   }
 
-  // Read all cookies in PARALLEL (Promise.all) — reading them
-  // sequentially would add each one's wait time on top of the last,
-  // increasing total latency.
   const [fbc, fbp, gclAw, gclGb, ttp] = await Promise.all([
     safeGetCookie('_fbc'),
     safeGetCookie('_fbp'),
-    safeGetCookie('_gcl_aw'),   // gclid lives here
-    safeGetCookie('_gcl_gb'),   // gbraid lives here (iOS/app campaigns)
+    safeGetCookie('_gcl_aw'),
+    safeGetCookie('_gcl_gb'),
     safeGetCookie('_ttp')
   ]);
 
   const gclid = extractAfterSecondDot(gclAw);
   const gbraid = extractAfterSecondDot(gclGb);
-  const result = {
-    fbc, fbp, ttp,
-    gclid, gcl_aw_raw: gclAw,
-    gbraid, gcl_gb_raw: gclGb
-  };
+  const result = { fbc, fbp, ttp, gclid, gcl_aw_raw: gclAw, gbraid, gcl_gb_raw: gclGb };
 
   if (isLog) console.log('COOKIE: values read ->', result);
   return result;
 }
 
-// No well-documented, widely-recognized cookie name was found for
-// wbraid specifically (low confidence) — so we only read it from the
-// URL. UTM parameters work the same way: there's no standard cookie for
-// these either; they're only read if they happen to still be present in
-// the checkout URL. IN MOST CASES THESE ARE EXPECTED TO BE `null` — by
-// the time checkout is reached, these parameters have usually already
-// disappeared from the URL (unless persisted, see the ATTRIBUTION
-// PERSISTENCE section below for how we work around this). Not a bug,
-// just a limitation of URL-only reading.
-function getUrlBasedSignals(url) {
+// =======================================================================
+// PART 3 — ATTRIBUTION (UTM + Click-ID) PERSISTENCE via Cookie Keeper
+// =======================================================================
+// UTM/click-ID parameters live in the URL on the storefront but are gone
+// by the time the customer reaches checkout. Instead of bridging that gap
+// with a homemade localStorage + TTL hack, we write the same values into
+// a normal first-party cookie (`_stape_attr`) via Shopify's sanctioned
+// browser.cookie.set() API, and let Stape's Cookie Keeper power-up do
+// what it already does for _fbp/_fbc/_gcl_aw/_gcl_gb/_ttp: extend its
+// lifetime past Safari ITP's cap and restore it across the checkout
+// sandbox boundary via a server response.
+//
+// IMPORTANT: add `_stape_attr` as a custom cookie in Power-ups -> Cookie
+// Keeper -> Custom cookies, with whatever expiration fits your
+// attribution window. Without that step this still works for the current
+// browser session, but won't get the extended-lifetime / cross-context
+// restoration Cookie Keeper provides for the other cookies.
+
+const ATTR_COOKIE_NAME = '_stape_attr';
+const UTM_KEYS = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content'];
+const CLICK_ID_KEYS = ['gclid', 'fbclid', 'wbraid'];
+const ATTR_KEYS = [...UTM_KEYS, ...CLICK_ID_KEYS];
+
+function extractAttrParamsFromUrl(url) {
   let params;
   try {
     params = new URL(url).searchParams;
   } catch (err) {
-    if (isLog) console.warn('URL: could not be parsed ->', url, err);
-    return { wbraid: null, utm_source: null, utm_medium: null, utm_campaign: null, utm_term: null, utm_content: null };
+    if (isLog) console.warn('ATTR: URL could not be parsed ->', url, err);
+    return {};
   }
-
-  const result = {
-    wbraid: params.get('wbraid') || null,
-    utm_source: params.get('utm_source') || null,
-    utm_medium: params.get('utm_medium') || null,
-    utm_campaign: params.get('utm_campaign') || null,
-    utm_term: params.get('utm_term') || null,
-    utm_content: params.get('utm_content') || null,
-  };
-
-  if (isLog) console.log('URL: signals ->', result);
-  return result;
+  const out = {};
+  for (const key of ATTR_KEYS) {
+    const value = params.get(key);
+    if (value) out[key] = value;
+  }
+  return out;
 }
 
-// =======================================================================
-// PART 3 — ATTRIBUTION (UTM + Click-ID) PERSISTENCE via browser.localStorage
-// =======================================================================
-// UTM/click-ID parameters live in the URL on the storefront, but they're
-// gone by the time the customer reaches checkout. To bridge that gap, we
-// persist them to localStorage (via Shopify's sanctioned async
-// browser.localStorage API, which reaches the real top-frame storage,
-// same as browser.cookie) and restore them at checkout.
-//
-// This piggybacks on the EXISTING page_viewed subscription that already
-// runs on every storefront page (see the `else` branch further down) —
-// no separate theme script or code on the storefront is required. When
-// a storefront page_viewed event carries UTM/click-ID parameters in its
-// URL, they get merged into localStorage; at checkout, we simply read
-// whatever's there (within the TTL window).
-//
-// 30-minute TTL — a reasonable default for session-scoped attribution.
-// If your typical browse-to-checkout time is longer, consider raising
-// ATTR_TTL_MS (note this is shorter than typical 7–28 day ad-platform
-// click windows — this only bridges the storefront-to-checkout gap
-// within a single session, not long-term attribution).
+async function saveAttributionCookie(url) {
+  const fresh = extractAttrParamsFromUrl(url);
+  if (Object.keys(fresh).length === 0) return; // nothing new — leave the cookie untouched
 
-const ATTR_KEY = 'shopify_pixel_attr_v1';
-const ATTR_TTL_MS = 30 * 60 * 1000; // 30 minutes
-
-async function persistAttribution(url) {
   try {
-    const params = new URL(url).searchParams;
-    const raw = await browser.localStorage.getItem(ATTR_KEY);
-    let stored = {};
-    try { stored = raw ? JSON.parse(raw) : {}; } catch (e) {}
-    const fresh = {
-      utm_source: params.get('utm_source'),
-      utm_medium: params.get('utm_medium'),
-      utm_campaign: params.get('utm_campaign'),
-      utm_term: params.get('utm_term'),
-      utm_content: params.get('utm_content'),
-      gclid: params.get('gclid'),
-      fbclid: params.get('fbclid'),
-      wbraid: params.get('wbraid'),
-    };
-    // Only overwrite a stored field if the fresh URL actually has a
-    // value for it — a param missing from the new URL doesn't erase a
+    const existingRaw = await safeGetCookie(ATTR_COOKIE_NAME);
+    let existing = {};
+    if (existingRaw) {
+      try { existing = JSON.parse(decodeURIComponent(existingRaw)); } catch (e) {}
+    }
+    // Only overwrite a stored field if the fresh URL actually has a value
+    // for it — a param missing from the new URL doesn't erase a
     // previously captured one.
-    const merged = { ...stored };
-    for (const [key, value] of Object.entries(fresh)) {
-      if (value !== null && value !== undefined && value !== '') {
-        merged[key] = value;
-      }
-    }
-    merged.saved_at = Date.now();
-    await browser.localStorage.setItem(ATTR_KEY, JSON.stringify(merged));
-    if (isLog) console.log('ATTR: saved ->', merged);
+    const merged = { ...existing, ...fresh };
+    const cookieValue = encodeURIComponent(JSON.stringify(merged));
+
+    // 30-day default expiry for the initial write; Cookie Keeper (once
+    // configured, see comment above) takes over extending/restoring it
+    // beyond this.
+    await browser.cookie.set(ATTR_COOKIE_NAME + '=' + cookieValue + '; max-age=2592000');
+    if (isLog) console.log('ATTR: saved to cookie ->', merged);
   } catch (err) {
-    if (isLog) console.warn('ATTR: error while saving ->', err);
+    if (isLog) console.warn('ATTR: could not save cookie ->', err);
   }
 }
 
-async function getAttribution() {
+async function readAttributionCookie() {
+  const raw = await safeGetCookie(ATTR_COOKIE_NAME);
+  if (!raw) return {};
   try {
-    const raw = await browser.localStorage.getItem(ATTR_KEY);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw);
-    if (Date.now() - (parsed.saved_at || 0) > ATTR_TTL_MS) {
-      await browser.localStorage.removeItem(ATTR_KEY);
-      if (isLog) console.log('ATTR: 30 minutes elapsed, cleared');
-      return {};
-    }
-    const { saved_at, ...rest } = parsed;
-    return rest;
+    return JSON.parse(decodeURIComponent(raw));
   } catch (err) {
-    if (isLog) console.warn('ATTR: error while reading ->', err);
+    if (isLog) console.warn('ATTR: could not parse stored cookie ->', err);
     return {};
   }
 }
 
-async function prepareDataLayerObject(event, eventName) {
-  if (isLog) {
-    console.log('event', event);
+// Current URL always wins over what's stored in the cookie.
+async function getAttribution(currentUrl) {
+  const fresh = extractAttrParamsFromUrl(currentUrl);
+  const stored = await readAttributionCookie();
+  return { ...stored, ...fresh };
+}
+
+// Appends UTM params onto a URL (only the ones not already present there).
+// Click IDs are deliberately NOT folded in here — see UPDATE 2 (C) above.
+function buildEnrichedUrl(url, params) {
+  if (!params || Object.keys(params).length === 0) return url;
+  try {
+    const urlObj = new URL(url);
+    for (const [key, value] of Object.entries(params)) {
+      if (value && !urlObj.searchParams.has(key)) {
+        urlObj.searchParams.set(key, value);
+      }
+    }
+    return urlObj.toString();
+  } catch (err) {
+    if (isLog) console.warn('ATTR: could not build enriched actual_url ->', err);
+    return url;
   }
+}
+
+async function prepareDataLayerObject(event, eventName) {
+  if (isLog) console.log('event', event);
 
   const ecomm_pagetype = getPageType();
   const ecom = parseEcomParams(event);
   ecom.items = parseItems(event);
-  const userData = parseUserData(event);
+
+  const user_data = clearObj(parseUserData(event));
   const cart_state = getCart(initContext?.data?.cart || {});
   const market = extractMarketData(event);
   const marketingCookies = await getMarketingCookies();
 
   // === URL cleanup (strip a stray trailing "]" observed in testing) ===
-  // NOTE: root cause not fully confirmed, but this sanitization was found
-  // to be empirically necessary — kept as a defensive safeguard.
   const rawUrl = event?.context?.document?.location?.href ||
     initContext?.context?.document?.location?.href ||
     href;
   const currentUrl = rawUrl.replace(/\]$/, '');
 
-  // === Attribution parameters from the current URL ===
-  const urlParams = new URL(currentUrl).searchParams;
-  const currentUtmSource = urlParams.get('utm_source');
-  const currentGclid = urlParams.get('gclid');
-
-  // === If the storefront URL carries fresh attribution, persist it ===
-  if (currentUtmSource || currentGclid || urlParams.get('utm_medium') || urlParams.get('fbclid') || urlParams.get('wbraid')) {
-    await persistAttribution(currentUrl);
+  // === On storefront pages, capture fresh attribution into the cookie ===
+  if (!isCheckoutPage) {
+    await saveAttributionCookie(currentUrl);
   }
 
-  // === Restore previously stored attribution (checkout fallback) ===
-  const stored = await getAttribution();
+  // === Resolve attribution: current URL > _stape_attr cookie ===
+  const attribution = await getAttribution(currentUrl);
 
-  // === Final merge priority: current URL > localStorage > cookie (gclid only) > null ===
-  const utm_source = currentUtmSource || stored.utm_source || null;
-  const utm_medium = urlParams.get('utm_medium') || stored.utm_medium || null;
-  const utm_campaign = urlParams.get('utm_campaign') || stored.utm_campaign || null;
-  const utm_term = urlParams.get('utm_term') || stored.utm_term || null;
-  const utm_content = urlParams.get('utm_content') || stored.utm_content || null;
-  const gclid = currentGclid || stored.gclid || marketingCookies.gclid || null;
-  const wbraid = urlParams.get('wbraid') || stored.wbraid || null;
-  const fbclid = urlParams.get('fbclid') || stored.fbclid || null;
+  const utmParamsForUrl = {};
+  for (const key of UTM_KEYS) {
+    if (attribution[key]) utmParamsForUrl[key] = attribution[key];
+  }
 
-  if (isLog && (utm_source || stored.utm_source)) {
-    console.log('ATTR: merge ->', { current: currentUtmSource, stored: stored.utm_source, final: utm_source });
+  const event_id = generateEventId(event, eventName);
+  const actual_url = buildEnrichedUrl(currentUrl, utmParamsForUrl);
+  const fbc = marketingCookies.fbc;
+  const fbp = marketingCookies.fbp;
+  const ttp = marketingCookies.ttp;
+  const gbraid = marketingCookies.gbraid;
+  const gclid = attribution.gclid || marketingCookies.gclid || null;
+  const fbclid = attribution.fbclid || null;
+  const wbraid = attribution.wbraid || null;
+  const consent = event?.consent || currentConsentState;
+
+  if (isLog) {
+    console.log('ATTR: resolved ->', { actual_url, gclid, fbclid, wbraid, utmParamsForUrl });
   }
 
   let obj = {
     event: event_name[eventName],
-    event_id: generateEventId(event, eventName),
-    user_data: clearObj(userData),
+    event_id,
+    user_data,
     cart_state,
     ecomm_pagetype,
-    actual_url: currentUrl,
-    // PART 2: marketing click-IDs
-    fbc: marketingCookies.fbc,
-    fbp: marketingCookies.fbp,
-    gclid: gclid,
-    gbraid: marketingCookies.gbraid,
-    ttp: marketingCookies.ttp,
-    // PART 2b: URL-based signals + localStorage fallback
-    wbraid: wbraid,
-    utm_source: utm_source,
-    utm_medium: utm_medium,
-    utm_campaign: utm_campaign,
-    utm_term: utm_term,
-    utm_content: utm_content,
-    fbclid: fbclid,
-    // For an explicit, server-side-checkable filter
-    consent: event?.consent || currentConsentState,
+    actual_url,
+    fbc,
+    fbp,
+    gclid,
+    gbraid,
+    ttp,
+    wbraid,
+    fbclid,
+    consent,
   };
 
   if ([
@@ -538,23 +535,15 @@ async function handleAnalyticsEvent(event) {
   const isPageViewed = eventName === "page_viewed";
 
   const data = await prepareDataLayerObject(event, eventName);
-  if (isLog) {
-    console.log('Send event data', data);
-  }
+  if (isLog) console.log('Send event data', data);
 
   const pushData = () => {
     if (isCheckoutPage) {
-      // Checkout page: push everything to dataLayer
       window.dataLayer = window.dataLayer || [];
       window.dataLayer.push(data);
     } else if (isPageViewed) {
-      // Non-checkout page: only relay page_viewed to the parent window
-      // (this is also where attribution gets captured into localStorage,
-      // see PART 3 above — persistAttribution runs inside
-      // prepareDataLayerObject for every storefront page_viewed)
       window.parent.postMessage(data, location.origin);
     }
-    // No push happens for other event types outside checkout
   };
 
   setTimeout(pushData, 500);
@@ -596,32 +585,16 @@ function getPageType() {
   else if (path.includes('/checkout')) { return 'basket'; }
   else { return 'other'; }
 }
+
 // -----------------------------------------------------------------------
-// loadGTM — Stape's first-party (custom subdomain) GTM loader code. This
-// part is unchanged in behavior — it already runs through your own
-// personal subdomain (data.farruxbek.online), so it's resistant to
-// adblockers. Only this function remains from Stape's original
-// implementation; the old wrapper that fetched from sp.stapecdn.com has
-// been fully removed.
+// loadGTM — Stape's first-party (custom subdomain) GTM loader code.
+// Unchanged from v1.
 // -----------------------------------------------------------------------
 function loadGTM(key) {
 
   if (isInsertGTM) return;
   isInsertGTM = true;
 
-  // Note: this used to have 3 different `case` branches keyed by `key`
-  // (market ID), but all three were byte-for-byte identical, and since
-  // useMultyMarkets is currently `false`, execution always fell through
-  // to `default` anyway — the duplicated dead code was removed.
-  //
-  // The code below is Stape's minified GTM loader snippet, rewritten
-  // with THE EXACT SAME LOGIC but with readable, non-colliding variable
-  // names. Reason: during minification, the same short name (d, g, v, E,
-  // f) was reused twice within a single function — this isn't a JS error
-  // (`var` allows redeclaration like this), but Shopify's editor checker
-  // flagged it as "already defined" / "used out of scope". Every step
-  // was checked against the original — the domain, container ID, and
-  // query string are unchanged.
   !function () {
     "use strict";
 
@@ -667,7 +640,6 @@ function loadGTM(key) {
       }
     }
 
-    // ---- Stape configuration (original values, unchanged) ----
     var GTM_LOADER_DOMAIN = "https://data.farruxbek.online";
     var GTM_LOADER_DOMAIN_FALLBACK = "";
     var CONTAINER_ID = "3sibtwmwlxmfa";
@@ -812,7 +784,6 @@ function parseItems(event) {
     }
   }
 
-  // Parse search result product variants
   if (event.data?.searchResult?.productVariants) {
     for (let i = 0; i < event.data.searchResult.productVariants.length; i++) {
       const variant = event.data.searchResult.productVariants[i];
