@@ -174,8 +174,12 @@ function prepareDataLayerObject(event, eventName) {
   const market         = extractMarketData(event);
   const event_id       = generateEventId(event, eventName);
 
-  const rawUrl     = event?.context?.document?.location?.href || initContext?.context?.document?.location?.href || href;
-  const actual_url = rawUrl.replace(/\]$/, '');
+// YANGI
+const actual_url = (
+  initContext?.context?.document?.location?.href ||
+  window?.location?.href ||
+  href
+).replace(/\]$/, '');
 
   const resolvedConsent                 = event?.consent || currentConsentState || {};
   const consent_ad_storage              = resolvedConsent.ad_storage              || null;
@@ -728,12 +732,11 @@ if (event.name === "checkout_completed") {
   ecom.tax                 = event?.data?.checkout?.totalTax?.amount;
   ecom.shipping            = event?.data?.checkout?.shippingLine?.price?.amount;
 
-  // TOʻGʻRILANDI: GID'dan faqat raqamni ajratib olish va Fallback (zaxira) qo'shish
-  const rawOrderId         = event?.data?.checkout?.order?.id;
-  const orderName          = event?.data?.checkout?.order?.name;
-  const checkoutToken      = event?.data?.checkout?.token;
+const rawOrderId    = event?.data?.checkout?.order?.id;
+const orderName     = event?.data?.checkout?.order?.name;
+const str           = rawOrderId ? String(rawOrderId) : null;
+ecom.transaction_id = (str && str.includes('/') ? str.split('/').pop() : str) || orderName || null;
 
-  ecom.transaction_id      = extractNumericId(rawOrderId) || orderName || checkoutToken || null;
     var discountApplications = event?.data?.checkout?.discountApplications || [];
     var discountTitles       = discountApplications.map(function(d) { return d?.title; }).filter(Boolean);
     var discountAmountTotal  = discountApplications.reduce(function(sum, d) {
